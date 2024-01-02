@@ -1,0 +1,1526 @@
+---
+title: "MY472_assignment_final"
+author: "202018227"
+date: "20/12/2023"
+output:
+  html_document:
+    df_print: paged
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_fold: show
+---
+
+```{r setup, include=FALSE} 
+# this chunk contains code that sets global options for the entire .Rmd. 
+# we use include=FALSE to suppress it from the top of the document, but it will still appear in the appendix. 
+
+knitr::opts_chunk$set(echo = FALSE) # actually set the global chunk options. 
+# we set echo=FALSE to suppress code such that it by default does not appear throughout the document. 
+# note: this is different from .Rmd default
+
+library(tidyverse)
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(DBI)
+library(ggplot2)
+library(viridis)
+library(RColorBrewer)
+library(patchwork)
+library(scales)
+```
+
+[Github repo](https://github.com/psyvesw/MY472_final_assignment.git)
+
+# 1. Introduction
+![Stop and Search in UK](search_photo.jpg)
+
+The UK's stop-and-search procedure, which empowers police to search individuals suspected of possessing illegal items, faces scrutiny over potential profiling biases. These biases may pivot on personal characteristics—race, ethnicity, age—over concrete evidence, compromising the fairness of law enforcement. Therefore, this study aims to investigate profiling biases within London’s stop-and-search operations over a year.  
+
+## 1.1 Methodology 
+To discern if disparities in stop-and-search rates (SSR) are indicative of bias or reflective of legitimate policing patterns, the study employs a two-stage analytical framework:    
+
+**1.	Pattern Identification:**  
+Quantitative assessment of SSR across different demographic groups, paired with an analysis of the types of search objects.    
+**2.	Bias Confirmation:**  
+
+  **a. Comparative Analysis:**  
+    - *Population Comparison*: Evaluating whether SSR are proportional to the demographic composition of London.   
+    - *Arrest Rate Analysis*: Comparing SSR to arrest statistics to determine if certain demographics are being searched more frequently without a corresponding increase in criminal activity.  
+    
+  **b. Benchmarks:**  
+    - Ratios > 1 when contrasting search rates with population or arrest statistics signal potential over-targeting beyond what demographic or criminal activity data would rationalize. 
+    
+  **c. Outcome Analysis:**  
+    - If certain groups have a higher frequency of searches but a lower rate of positive outcomes ('hits'), this could imply a discrepancy between suspicion and actual criminal activity, signaling biase.  
+    
+# 2. Data
+The core of this analysis rests on stop-and-search records from London, collected from 31 November 2022 to 31 October 2023 via API scraping from [data.police.uk](https://data.police.uk/docs/method/stops-street/). Complementary demographic insights were derived from [the 2021 Census data from England and Wales](https://www.ons.gov.uk/peoplepopulationandcommunity/culturalidentity/ethnicity/bulletins/ethnicgroupenglandandwales/census2021) and [the Greater London Authority (2019)](https://data.london.gov.uk/social-evidence-base/population/). Arrest statistics up to March 2022 were obtained from [the UK government's official repository](https://www.gov.uk/government/statistics/police-powers-and-procedures-stop-and-search-and-arrests-england-and-wales-year-ending-31-march-2022).
+
+## 2.1 Stop and Search Data 
+* Vehicle-only searches were removed. 
+* Cases lacking both self-defined and officer-defined ethnicity were omitted.
+* In instances of unreported self-defined ethnicity, officer-defined ethnicity was utilized.
+
+```{r data1_a, cache=TRUE, message=FALSE, warning=FALSE}
+# ___ Stop and Search Data for London in Year Ending 31 October 2023 ___
+
+# ___ Data Access: scrap the stop and search data from 2023-04 to 2023-10 in London using the API ___
+
+# API endpoint and parameters for  London as a custom area
+base_url <- "https://data.police.uk/api/stops-street"
+london_poly <- "51.631281,0.223716:51.605604,0.073060:51.541012,0.332974:51.296880,0.091089:51.338542,-0.038244:51.287790,-0.118609:51.467672,-0.510495:51.631721,-0.498641:51.691930,-0.148304:51.680473,-0.012827"
+
+# Initialize an empty list to store the data from each month
+monthly_data <- list()
+
+# Initialize a counter for indexing the monthly_data list
+list_counter <- 1
+
+# Loop through 2023-04 to 2023-10
+for (month in 4:10) {
+  # Format the month to "YYYY-MM" format
+  date_param <- sprintf("2023-%02d", month)
+
+  # Make the API request
+  response <- GET(url = base_url, query = list(poly = london_poly, date = date_param))
+
+  # Check if the request was successful
+  if (status_code(response) == 200) {
+    # Parse JSON response
+    month_data <- fromJSON(rawToChar(response$content))
+    # Add the month's data to the list using the list_counter for indexing
+    monthly_data[[list_counter]] <- month_data
+  } else {
+    print(paste("Failed to fetch data for month:", month, "Status code:", status_code(response)))
+  }
+  
+  # Increment the list_counter
+  list_counter <- list_counter + 1
+}
+
+combined_data <- bind_rows(monthly_data)
+```
+
+```{r data1_b, message=FALSE, warning=FALSE}
+# ___ Data Cleaning ___
+
+# Flatten the nested structure in stop_search_data for easier manipulation
+stop_search_data <- combined_data %>%
+  unnest(outcome_object) %>%
+  unnest(location) 
+
+# Filter to exclude vehicle searches
+stop_search_data <- stop_search_data %>%
+  filter(type == "Person search")
+
+# Remove unused columns
+stop_search_data <- stop_search_data %>%
+  select(-legislation, -involved_person, -outcome, -removal_of_more_than_outer_clothing, 
+         -id, -name, -operation, -operation_name, -type)
+ 
+# Recode NA as Unknown
+stop_search_data <- stop_search_data %>%
+  mutate(
+    self_defined_ethnicity = ifelse(is.na(self_defined_ethnicity), "Unknown", self_defined_ethnicity),
+    officer_defined_ethnicity = ifelse(is.na(officer_defined_ethnicity), "Unknown", officer_defined_ethnicity),
+    age_range = ifelse(is.na(age_range), "Unknown", age_range),
+    gender = ifelse(is.na(gender), "Unknown", gender)
+  ) 
+
+# Clean ethnicity data
+stop_search_data <- stop_search_data %>%
+  mutate(
+    combined_ethnicity = ifelse(self_defined_ethnicity == "Unknown", officer_defined_ethnicity, self_defined_ethnicity)
+  ) %>%
+  # Recode the detailed ethnicity into specific categories
+  mutate(Ethnicity = case_when(
+    grepl("Bangladeshi", self_defined_ethnicity) ~ "Bangladeshi",
+    grepl("Chinese", self_defined_ethnicity) ~ "Chinese",
+    grepl("Indian", self_defined_ethnicity) ~ "Indian",
+    grepl("Pakistani", self_defined_ethnicity) ~ "Pakistani",
+    grepl("Asian/Asian British - Any other", self_defined_ethnicity) ~ "Asian Other",
+    grepl("Black/African/Caribbean/Black British - African", self_defined_ethnicity) ~ "Black African",
+    grepl("Black/African/Caribbean/Black British - Caribbean", self_defined_ethnicity) ~ "Black Caribbean",
+    grepl("Black/African/Caribbean/Black British - Any other", self_defined_ethnicity) ~ "Black Other",
+    grepl("Mixed/Multiple ethnic groups - White and Black African", self_defined_ethnicity) ~ "Mixed White and Black African",
+    grepl("Mixed/Multiple ethnic groups - White and Black Caribbean", self_defined_ethnicity) ~ "Mixed White and Black Caribbean",
+    grepl("Mixed/Multiple ethnic groups - White and Asian", self_defined_ethnicity) ~ "Mixed White and Asian",
+    grepl("Mixed/Multiple ethnic groups - Any other", self_defined_ethnicity) ~ "Mixed Other",
+    grepl("White - English/Welsh/Scottish/Northern Irish/British", self_defined_ethnicity) ~ "White British",
+    grepl("White - Irish", self_defined_ethnicity) ~ "White Irish",
+    grepl("White - Any other", self_defined_ethnicity) ~ "White Other",
+    grepl("Other ethnic group", self_defined_ethnicity) | self_defined_ethnicity == "Any Other Ethnic Background" ~ "Other",
+    grepl("^White$", self_defined_ethnicity) ~ "White British",
+    self_defined_ethnicity == "Unknown" ~ "Unknown",
+    TRUE ~ self_defined_ethnicity  # Keep original ethnicity if not matched above
+  ))
+
+# Categorize each specific ethnicity into a broader group and called it ethnicity_broad
+stop_search_data <- stop_search_data %>%
+  mutate(ethnicity_broad = case_when(
+    grepl("Asian", Ethnicity) ~ "Asian",
+    grepl("White", Ethnicity) ~ "White",
+    grepl("Black", Ethnicity) ~ "Black",
+    grepl("Mixed", Ethnicity) ~ "Mixed",
+    Ethnicity == "Other" ~ "Other",
+    Ethnicity == "Unknown" ~ "Unknown",
+    TRUE ~ "Unknown"  # Catch-all condition to handle NA and any other unclassified cases
+  ))
+
+# Rename long column names, remove unused column and reorder columns
+stop_search_data <- stop_search_data %>%
+  rename(outcome = outcome_linked_to_object_of_search, ethnicity = Ethnicity) %>%
+  select(-street, -officer_defined_ethnicity, -self_defined_ethnicity) %>%
+  select(age_range, gender, ethnicity, ethnicity_broad, object_of_search, outcome, combined_ethnicity)
+
+# Print the cleaned stop and search data with a heading
+stop_search_data %>%
+  head(7) %>%
+  kable("html", 
+        col.names = c("Age", "Gender", "Ethnicity", "Broad Ethnicity", "Object of Search", "Outcome", "Combined Ethnicity"), 
+        caption = "Cleaned Stop and Search Data for Inner London in Year Ending 31 October 2023") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue") 
+
+```
+
+
+## 2.2 Structure of Cleaned Additional Datasets
+
+### 2.2.1 Ethnic group, England and Wales: Census 2021
+
+```{r data2, message=FALSE, warning=FALSE}
+# ___ Ethnicity General Data ___
+
+# ___ Data Processing and Cleaning___
+
+# Read tables from the census data
+uk_ethnicity <- read.csv("data/uk_ethnicity_broad.csv")
+
+# Only required London data
+London_ethnicity <- uk_ethnicity %>%
+  filter(Geography == "London") %>%
+  rename(percentage = `X.`, ethnicity = `Ethnicity`, geography = `Geography`)
+
+# Combine White British and White Other into White
+London_ethnicity <- London_ethnicity %>%
+  mutate(ethnicity_broad = ifelse(ethnicity %in% c("White British", "White other"), "White", ethnicity)) %>%
+  group_by(ethnicity_broad, geography) %>%
+  summarize(percentage = sum(percentage), .groups = "drop")
+
+# Display table
+London_ethnicity %>%
+  kable("html", 
+        col.names = c("Broad Ethnicity", "Geography", "Percentage"), 
+        caption = "London Ethnicity Distribution 2021") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue") 
+
+```
+
+
+### 2.2.2 London's diverse population from Greater London Authority (2019)
+```{r data3_a, message=FALSE, warning=FALSE}
+# ___ Age and Sex General Data ___
+
+# ___ Data Processing and Cleaning___
+
+london_age_sex <- read.csv("data/london_age_sex_distribution.csv")
+
+# Data manipulation
+london_age_sex <- london_age_sex %>%
+  rename(Percentage = "Per.cent.of.population")
+
+# Create london_sex dataframe 
+london_sex <- london_age_sex %>%
+  filter(Category %in% c("Male", "Female")) %>%
+  rename(gender = Category, population_percentage = Percentage)
+
+# Create london_age dataframe 
+london_age <- london_age_sex %>%
+  filter(!Category %in% c("Total", "Gender", "Male", "Female")) %>%
+  rename(age_range = Category,
+         population_percentage = Percentage)
+
+# Recategorise age ranges to match the format used in stop and search data
+london_age <- london_age %>%
+  mutate(age_range = case_when(
+    age_range == "0-4"   ~ "under 10",
+    age_range == "5-15"  ~ "10-17",
+    age_range == "16-24" ~ "18-24",   # Assuming that 16-17 should be included in 18-24 as per stop_search_data
+    age_range == "25-34" ~ "25-34",
+    age_range %in% c("35-49", "50-64", "65-79", "80+") ~ "over 34",
+    TRUE ~ "Unknown"                  # Catch-all for any other age ranges
+  ))
+
+# Calculate the total number of people in each age range and its corresponding percentage
+london_age <- london_age %>%
+  group_by(age_range) %>%
+  summarise(
+    Number = sum(Number),
+    population_percentage = sum(population_percentage)
+  ) %>%
+  ungroup()  
+
+```
+
+```{r data3_b, message=FALSE, warning=FALSE}
+london_age %>%
+  kable("html", 
+        col.names = c("Age", "Number", "Population Percentage"), 
+        caption = "London Age Distribution 2019") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue") 
+```
+```{r data3_c, message=FALSE, warning=FALSE}
+london_sex %>%
+  kable("html", 
+        col.names = c("Gender", "Number", "Population Percentage"), 
+        caption = "London Gender Distribution 2019") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue") 
+```
+
+
+### 2.2.3 Arrest summary tables: year ending 31 March 2022
+
+```{r data4_a, message=FALSE, warning=FALSE}
+# ___ Arrest Summary General Data ___
+
+# ___ Data Processing and Cleaning___
+
+# Read three tables from GOV.UK
+uk_arrest_ethnicity<-read.csv("data/uk_arrest_proportion_ethnicity.csv")
+uk_arrest_age<-read.csv("data/uk_arrest_age.csv")
+uk_arrest_sex<-read.csv("data/uk_arrest_sex.csv")
+
+# Data manipulation
+uk_arrest_ethnicity <- uk_arrest_ethnicity %>%
+  rename(ethnicity_broad = "Self.defined.ethnicity", 
+         Arrest_Rate = "Proportion....",
+         rate_per1000 = "Arrest.rate.per.1.000.population") %>%
+    select(-rate_per1000)
+
+uk_arrest_ethnicity <- uk_arrest_ethnicity %>%
+  mutate(ethnicity_broad = case_when(
+    ethnicity_broad == "Asian (or Asian British)" ~ "Asian",
+    ethnicity_broad == "Black (or Black British)" ~ "Black",
+    ethnicity_broad == "Not stated" ~ "Unknown",
+    TRUE ~ ethnicity_broad  # Default case to keep other values as is
+  )) %>%
+  # Remove commas from all numeric columns and convert to integer
+  mutate_at(vars(Number:Arrest_Rate), ~as.integer(gsub(",", "", .)))
+
+uk_arrest_age <- uk_arrest_age %>%
+  rename("<10" = "Under.101", 
+         "10-17" = "Aged.10.17",
+         "18-20" = "Aged.18.20",
+         ">21" = "Aged.21.and.over",
+         "Unknown" = "Age.unknown")
+
+uk_arrest_age <- uk_arrest_age %>%
+  # Convert Year to an integer
+  mutate(Year = as.integer(sub("/.*", "", Year))) %>%
+  # Remove commas and convert columns to numeric, handling '-' as NA
+  mutate(across(c(`<10`, `10-17`, `18-20`, `>21`, `Unknown`, `Total`), 
+                ~as.numeric(gsub(",", "", na_if(.,"-"))))) 
+
+# Sum Total Arrests for Each Age Group Over the Years
+total_arrests_by_age <- uk_arrest_age %>%
+  summarise(
+    under_10 = sum(`<10`, na.rm = TRUE),
+    age_10_17 = sum(`10-17`, na.rm = TRUE),
+    age_18_20 = sum(`18-20`, na.rm = TRUE),
+    over_21 = sum(`>21`, na.rm = TRUE),
+    Unknown = sum(Unknown, na.rm = TRUE)
+  ) %>%
+  gather(key = "age_range", value = "total_arrests")
+
+# Calculate Total Arrests Across All Age Groups
+total_arrests_all_ages <- sum(total_arrests_by_age$total_arrests)
+
+# Calculate the Arrest Rate for Each Age Group
+arrest_rate_by_age <- total_arrests_by_age %>%
+  mutate(
+    arrest_rate = total_arrests / total_arrests_all_ages * 100,
+    age_range = case_when(
+      age_range == "under_10" ~ "under 10",
+      age_range == "age_10_17" ~ "10-17",
+      age_range == "age_18_20" ~ "18-20",
+      age_range == "over_21" ~ "over 21",
+      age_range == "Unknown" ~ "Unknown"
+    )
+  ) %>%
+  select(age_range, arrest_rate)
+
+uk_arrest_sex <- uk_arrest_sex %>%
+  # Convert Year to an integer representing the start year
+  mutate(Year = as.integer(sub("/.*", "", Year))) %>%
+  # Remove commas and convert numeric columns to integers
+  mutate(across(c(Males, Females, Persons), ~as.numeric(gsub(",", "", .)))) %>%
+  # Replace 'N/A' with NA and convert Other and Unknown to numeric
+  mutate(Other = as.numeric(gsub("N/A", NA, Other)),
+         Unknown = as.numeric(gsub("N/A", NA, Unknown)))
+
+# Renaming columns for consistency and clarity
+names(uk_arrest_sex) <-c("Year", "Male", "Female", "Other", "Unknown", "Total")
+
+# Summarize the total number of arrests by gender across all years
+gender_arrest_totals <- uk_arrest_sex %>%
+  summarise(
+    Male = sum(Male, na.rm = TRUE),
+    Female = sum(Female, na.rm = TRUE),
+    Other = sum(Other, na.rm = TRUE),
+    Unknown = sum(Unknown, na.rm = TRUE)
+  )
+
+# Transpose the dataframe and convert it into a long format
+arrest_rate_by_sex <- gender_arrest_totals %>%
+  pivot_longer(cols = everything(), names_to = "gender", values_to = "arrests")
+
+# Calculate the total number of arrests
+total_arrests <- sum(arrest_rate_by_sex$arrests, na.rm = TRUE)
+
+# Calculate arrest rates by gender
+arrest_rate_by_sex <- arrest_rate_by_sex %>%
+  mutate(arrest_rate = (arrests / total_arrests) * 100) %>%
+  select(-arrests)
+```
+
+
+```{r data4_b, message=FALSE, warning=FALSE}
+# Display these three tables
+uk_arrest_ethnicity %>%
+  kable("html", 
+        col.names = c("Broad Ethnicity", "Arrest Number", "Arrest Rate"), 
+        caption = "Number of Persons Arrested by Ethnic Group 2006 to 2021") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+
+```{r data4_c, message=FALSE, warning=FALSE}
+arrest_rate_by_age %>%
+  kable("html", 
+        col.names = c("Age", "Arrest Rate"), 
+        caption = "Arrest Rates by Age Groups from 2006 to 2021") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+
+
+```{r data4_d, message=FALSE, warning=FALSE}
+arrest_rate_by_sex %>%
+  kable("html", 
+        col.names = c("Gender", "Arrest Rate"), 
+        caption = "Arrest Rates by Gender from 2006 to 2021") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+
+
+# 3. Analysis
+
+## 3.1 Ethnic Disparities 
+
+### 3.1.1 Disproportionate SSR
+> Individuals in the 'Other' category experience the highest rate at 34.31%, with 'White British' at 19.51%, and 'Black Other' at 11.34%. These figures, compared to the broad ethnic group rates—'Other' at 35.94%, ‘White’ at 33.09%, and 'Black' at 23.71%—demonstrate a skewed application towards certain groups.
+
+```{r analysis1_a, message=FALSE, warning=FALSE}
+# ___ Ethnicity Bias Pattern 1 Analysis ___
+
+# Calculate stop-and-search rates by ethnicity
+ethnicity_rates <- stop_search_data %>%
+  count(ethnicity) %>%
+  mutate(rate = n / sum(n) *100)
+
+# Calculate stop-and-search rates by broad ethnicity
+ethnicity_broad_rates <- stop_search_data %>%
+  filter(ethnicity_broad != "Unknown") %>% 
+  count(ethnicity_broad) %>%
+  mutate(rate = n / sum(n) *100) 
+
+```
+
+```{r analysis1_d, message=FALSE, warning=FALSE}
+# Vertical bar chart of search rates by specific ethnicity
+ggplot(ethnicity_rates, aes(x = rate, y = reorder(ethnicity, rate), fill = ethnicity)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis(discrete = TRUE) +  
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(size = rel(1.2)),
+    axis.title.y = element_blank(),
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.4), face = "bold", hjust = 0.5)
+  ) +
+  labs(title = "Stop-and-Search Rates by Ethnicity (Specific)", 
+       x = "Search Rate (%)", 
+       y = "Ethnicity")
+```
+
+```{r analysis1_c, message=FALSE, warning=FALSE}
+ethnicity_broad_rates %>%
+  kable("html", 
+        col.names = c("Broad Ethnicity", "Number of People", "Stop and Search Rate"), 
+        caption = "Stop and Search Rate Across Different Ethnicities (Broad)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+
+```
+
+### 3.1.2 Bias in Search Objectives
+> 'Other' are primarily searched for 'Offensive weapons' and 'Psychoactive substances', while 'White' are more often searched for 'Controlled drugs' and 'Criminal damage', suggesting potential bias in the perceived association between ethnicity and certain crimes.
+
+```{r analysis1_f, message=FALSE, warning=FALSE}
+# ___ Ethnicity Bias Pattern 2 Analysis ___
+
+ethnicity_proportion_within_object <- stop_search_data %>% 
+  filter(object_of_search != "NA") %>%
+  count(object_of_search, ethnicity_broad) %>%
+  group_by(object_of_search) %>%
+  mutate(proportion = n / sum(n) * 100) %>%
+  arrange(object_of_search, desc(proportion))
+
+```
+
+```{r analysis1_g, message=FALSE, warning=FALSE}
+# Visualization
+ggplot(ethnicity_proportion_within_object, aes(x = object_of_search, y = proportion, fill = ethnicity_broad)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "Ethnicity Proportion for Each Search Object",
+    subtitle = "Year Ending 31 October 2023",
+    x = "Object of Search",
+    y = "Proportion",
+    fill = "Ethnicity"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    axis.title.x = element_text(size = rel(1.1), face = "bold"), 
+    axis.title.y = element_text(size = rel(1.1), face = "bold"),
+    axis.text.x = element_text(size = rel(1), angle = 0, hjust = 0.5, vjust = 0.5),
+    axis.text.y = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2), face = "italic"),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20) # Add margins for spacing
+  )
+
+```
+
+### 3.1.3 Population and Arrest Rate Comparisons
+> The 'Other' and 'Black' categories show overrepresentation in SSR relative to their population sizes, with ratios of 5.70 and 1.76, respectively, contrasting with the 'Asian' category's underrepresentation at 0.25. Additionally, the disproportionate SSR to arrests for 'Other' (17.97) and 'Black' (2.63) ethnicities suggest a disparity not justified by arrest records.
+
+```{r analysis1_h, message=FALSE, warning=FALSE}
+# ___ Ethnicity Bias Verification 1 ___
+
+comparison_ethnicity <- stop_search_data %>%
+  count(ethnicity_broad) %>%
+  inner_join(London_ethnicity, by = "ethnicity_broad") %>%
+  mutate(search_rate = n / sum(n) * 100,
+         population_rate = percentage,
+         ratio = search_rate / population_rate) %>%
+  select(-percentage)
+
+# Transform the data to long format for visualisation
+comparison_ethnicity_long <- comparison_ethnicity %>%
+  pivot_longer(
+    cols = c(search_rate, population_rate),
+    names_to = "rate_type",
+    values_to = "rate"
+  )
+
+```
+
+```{r analysis1_i, message=FALSE, warning=FALSE}
+# Create a bar plot with ratio labels
+ggplot(comparison_ethnicity_long, aes(x = reorder(ethnicity_broad, rate), y = rate, fill = rate_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Set3") +
+  geom_text(
+    data = comparison_ethnicity,
+    aes(x = ethnicity_broad, y = max(search_rate, population_rate) + 2, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    position = position_dodge(width = 0.8),
+    vjust = 0.5, 
+    color = "darkblue", # Changed color for better visibility
+    size = 3.5, # Increased text size for readability
+    fontface = "bold" # Bold text for emphasis
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Comparing Search Rates with London Ethnicity Distribution",
+    subtitle = "Ratios shown above each pair of bars indicate disproportionality",
+    x = "Ethnicity", 
+    y = "Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    legend.box.background = element_rect(color = "gray80"),
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    plot.title = element_text(size = 16, face = "bold"), # Larger, bold title
+    plot.subtitle = element_text(size = 12), # Clear subtitle
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10) # Add margins for spacing
+  )
+
+```
+
+```{r analysis1_j, message=FALSE, warning=FALSE}
+# ___ Ethnicity Bias Verification 2 ___
+
+comparison_arrest_ethnicity <- merge(uk_arrest_ethnicity, ethnicity_broad_rates, by = "ethnicity_broad") 
+
+comparison_arrest_ethnicity <- comparison_arrest_ethnicity %>%
+  rename(arrest_number="Number",
+         arrest_rate="Arrest_Rate",
+         search_rate="rate",
+         search_number="n") %>%
+  mutate(ratio = search_rate / arrest_rate) 
+
+# Clean comparison_arrest_ethnicity
+comparison_arrest_ethnicity$arrest_rate[is.na(comparison_arrest_ethnicity$arrest_rate)] <- 0
+comparison_arrest_ethnicity$search_rate <- floor(comparison_arrest_ethnicity$search_rate) # Round down search rate
+
+# Ensuring correct data types
+comparison_arrest_ethnicity$ethnicity_broad <- as.factor(comparison_arrest_ethnicity$ethnicity_broad)
+comparison_arrest_ethnicity$arrest_number <- as.numeric(comparison_arrest_ethnicity$arrest_number)
+comparison_arrest_ethnicity$arrest_rate <- as.numeric(comparison_arrest_ethnicity$arrest_rate)
+comparison_arrest_ethnicity$search_number <- as.numeric(comparison_arrest_ethnicity$search_number)
+comparison_arrest_ethnicity$search_rate <- as.numeric(comparison_arrest_ethnicity$search_rate)
+
+```
+
+
+```{r analysis1_k, message=FALSE, warning=FALSE}
+# Reshape data for plotting
+comparison_arrest_ethnicity_long <- comparison_arrest_ethnicity %>%
+  select(ethnicity_broad, arrest_rate, search_rate) %>%
+  pivot_longer(cols = c(arrest_rate, search_rate), 
+               names_to = "Rate_Type", 
+               values_to = "Rate")
+
+# Create the plot
+ggplot(comparison_arrest_ethnicity_long, aes(x = reorder(ethnicity_broad, Rate), y = Rate, fill = Rate_Type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "Comparison of Search and Arrest Rates by Ethnicity",
+       x = "Ethnicity",
+       y = "Rate (per 100,000)",
+       fill = "Rate Type") +
+  geom_text(
+    data = comparison_arrest_ethnicity,
+    aes(x = ethnicity_broad, y = max(search_rate, arrest_rate) + 2, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    position = position_dodge(width = 0.8),
+    vjust = 0.5, 
+    color = "darkblue", # Changed color for better visibility
+    size = 3.5, # Increased text size for readability
+    fontface = "bold" # Bold text for emphasis
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    legend.position = "bottom",
+    legend.box.background = element_rect(color = "gray80"),
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    plot.title = element_text(size = 16, face = "bold"), # Larger, bold title
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10) # Add margins for spacing
+  )
+```
+
+### 3.1.4 Outcome Analysis
+> The 'Other' group exhibits a low hit rate of 29.51% against their SSR of 35.94%, and this hit rate is relatively low compared to other ethnicities, suggesting that a high number of searches do not lead to evidence of wrongdoing.
+
+```{r analysis1_l, message=FALSE, warning=FALSE}
+# ___ Ethnicity Bias Verification 3 ___
+
+# Calculate hit rate and miss rate
+ethnicity_hit_proportion <- stop_search_data %>%
+  filter(outcome %in% c("TRUE", "FALSE")) %>%
+  mutate(outcome = recode(factor(outcome), `TRUE` = "Hit", `FALSE` = "Miss")) %>%
+  group_by(ethnicity_broad, outcome) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = count,
+    values_fill = list(count = 0)
+  ) %>%
+  mutate(
+    total_searches = Hit + Miss,
+    hit_rate = Hit / total_searches * 100,
+    miss_rate = Miss / total_searches * 100
+  )
+
+```
+
+```{r analysis1_m, message=FALSE, warning=FALSE}
+# Transforming the dataframe into a long format
+ethnicity_hit_proportion_long <- ethnicity_hit_proportion %>%
+  select(ethnicity_broad, hit_rate, miss_rate) %>%
+  pivot_longer(
+    cols = c(hit_rate, miss_rate),
+    names_to = "outcome_type",
+    values_to = "rate"
+  )
+
+# Creating a stacked bar chart
+ggplot(ethnicity_hit_proportion_long, aes(x = ethnicity_broad, y = rate, fill = outcome_type)) +
+  geom_bar(stat = "identity", position = "fill") +  # Stacked bars with relative proportions
+  coord_flip() + 
+  scale_fill_brewer(palette = "Set3", name = "Outcome Type") +  # Color palette for better distinction
+  labs(
+    title = "Proportion of Hit and Miss Rates in Stop-and-Search by Ethnicitis",
+    subtitle = "Analysis of stop-and-search outcomes in different ethnicitis",
+    x = "Ethnicitis",
+    y = "Proportion",
+    fill = "Outcome Type"
+  ) +
+  theme_minimal() +  # Minimal theme for a clean look
+  theme(
+    legend.position = "bottom",  # Legend at the bottom for better interpretation
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),  # Slanted x-axis labels for readability
+    axis.title.x = element_text(size = rel(1.2), face = "bold"),  # Bold axis titles
+    axis.title.y = element_text(size = rel(1.2), face = "bold"),
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),  # Emphasized plot title
+    plot.subtitle = element_text(size = rel(1.2), hjust = 0.5),  # Clear subtitle
+    legend.title.align = 0.5,  # Center-aligned legend title
+    legend.box.background = element_rect(color = "gray80")  # Styled legend background for clarity
+  )
+
+
+```
+
+```{r analysis1_n, message=FALSE, warning=FALSE}
+hit_rates_ethnicity <- ethnicity_hit_proportion %>%
+  select(-miss_rate, -total_searches, -Miss)
+
+# Compare hit rate and search rate for each ethnicity group
+hit_search_ethnicity <- ethnicity_broad_rates %>%
+  inner_join(hit_rates_ethnicity, by = "ethnicity_broad") %>%
+  select(ethnicity_broad, rate, hit_rate) %>%
+  rename(search_rate = rate) %>%
+  mutate(ratio = search_rate / hit_rate)
+
+hit_search_ethnicity %>%
+  kable("html", 
+        col.names = c("Broad Ethnicity", "Search Rate", "Hit Rate", "Ratio"),
+        caption = "Comparison of Stop-and-Search Rate and Hit Rate by Ethnicity") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+
+```{r analysis1_o, message=FALSE, warning=FALSE}
+# Convert the dataframe from wide to long format for easier plotting
+hit_search_ethnicity_long <- hit_search_ethnicity %>%
+  pivot_longer(
+    cols = c(search_rate, hit_rate),
+    names_to = "rate_type",
+    values_to = "rate"
+  )
+
+# Visualization
+ggplot(hit_search_ethnicity_long, aes(x = ethnicity_broad, y = rate, fill = rate_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +  
+  scale_fill_brewer(palette = "Dark2", name = "Rate Type") +  
+  labs(
+    title = "Comparison of Search Rate and Hit Rate by Ethnicity",
+    subtitle = "Analyzing stop-and-search bias across ethnic groups",
+    x = "Ethnicity",
+    y = "Rate (%)",
+    fill = "Rate Type"
+  ) +
+  geom_text(
+    data = hit_search_ethnicity,
+    aes(x = ethnicity_broad, y = max(search_rate, hit_rate) + 2, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    position = position_dodge(width = 0.8),
+    vjust = 0.5, 
+    color = "darkblue", # Changed color for better visibility
+    size = 3.5, # Increased text size for readability
+    fontface = "bold" # Bold text for emphasis
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title.align = 0.5,
+    legend.box.background = element_rect(color = "gray80"),
+    legend.key.size = unit(1, "cm"),  # Increase legend key size for readability
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1), angle = 45, hjust = 1),
+    axis.text.y = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.5), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2), hjust = 0.5)
+  ) +
+  guides(fill = guide_legend())  
+
+```
+
+## 3.2 Age Disparities
+
+### 3.2.1 Disproportionate SSR
+> Individuals aged 18-24 and over 34 are most frequently subjected to stop-and-search at rates of 22.84% and 24.60%, respectively, with the 10-17 age group also facing a notable rate of 19.42%. 
+
+```{r analysis2_a, message=FALSE, warning=FALSE}
+# ___ Age Bias Pattern 1 Analysis ___
+
+# Calculate stop-and-search rates by age group
+age_rates <- stop_search_data %>%
+  count(age_range) %>%
+  mutate(rate = n / sum(n) * 100) %>%
+  filter(age_range != "under 10")
+
+age_rates %>%
+  kable("html", 
+        col.names = c("Age", "Number of Poeple", "Search Rate"), 
+        caption = "Stop and Search Rate Across Different Age Groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+
+```
+```{r analysis2_b, message=FALSE, warning=FALSE}
+# Bar chart of search rates by age
+ggplot(age_rates, aes(x = reorder(age_range, rate), y = rate, fill = age_range)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Pastel1") +  #
+  theme_minimal() +
+  theme(
+    legend.position = "none",  # Place the legend at the bottom
+    axis.text.y = element_text(size = rel(1.2)),  # Increase y-axis label size
+    axis.title.y = element_blank(),  # Remove y-axis title for cleaner look
+    axis.text.x = element_text(size = rel(1.1)),  # Increase x-axis label size
+    plot.title = element_text(size = rel(1.5), face = "bold", hjust = 0.5),  # Style the plot title
+    legend.title = element_blank()  # Remove legend title
+  ) +
+  labs(title = "Stop-and-Search Rates by Age Group", 
+       x = "Age Group", 
+       y = "Search Rate (%)",
+       fill = "Age Group")  +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.5), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2)),
+    # add margin
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+```
+
+
+### 3.2.2 Bias in Search Objectives
+> Teenagers (10-17) and young adults (18-24) more often searched for potentially harmful items, and those over 34 searched more for controlled drugs, hinting at age-related assumptions in search motives.
+
+```{r analysis2_c, message=FALSE, warning=FALSE}
+# ___ Age Bias Pattern 2 Analysis ___
+
+age_proportion_within_object <- stop_search_data %>%
+  filter(object_of_search != "NA") %>% 
+  count(object_of_search, age_range) %>%
+  group_by(object_of_search) %>%
+  mutate(proportion = n / sum(n) * 100) %>%
+  arrange(object_of_search, desc(proportion)) %>%
+  filter(!is.na(object_of_search)) 
+
+```
+
+```{r analysis2_d, message=FALSE, warning=FALSE}
+ggplot(age_proportion_within_object, aes(x = object_of_search, y = proportion, fill = age_range)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Pastel2")  +
+  labs(
+    title = "Age Group Proportion for Each Search Object",
+    x = "Object of Search",
+    y = "Proportion",
+    fill = "Age Group"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    axis.title.x = element_text(size = rel(1.1), face = "bold"), 
+    axis.title.y = element_text(size = rel(1.1), face = "bold"),
+    axis.text.x = element_text(size = rel(1), angle = 0, hjust = 0.5, vjust = 0.5),
+    axis.text.y = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2), face = "italic"),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20) # Add margins for spacing
+  )
+
+```
+
+### 3.2.3 Population Rate vs. SSR
+> The overrepresentation of the 18-24 age group—with a ratio exceeding 2—suggests that this group is being searched at more than double their expected rate based on population size, potentially pointing to age profiling.
+
+```{r analysis2_e, message=FALSE, warning=FALSE}
+# ___ Age Bias Verification 1 ___
+
+# Merge london_age with the stop-and-search data
+age_search_comparison <- age_rates %>%
+  rename(search_percentage = rate) %>%
+  left_join(london_age, by = "age_range") %>%
+  mutate(ratio = search_percentage / population_percentage) %>%
+  select(-Number) %>%
+  filter(age_range != "under 10", age_range != "Unknown")
+
+# Transform the data to long format for the bar chart
+age_search_comparison_long <- age_search_comparison %>%
+  pivot_longer(
+    cols = c(search_percentage, population_percentage),
+    names_to = "rate_type",
+    values_to = "rate"
+  )
+
+age_search_comparison %>%
+  kable("html", 
+        col.names = c("Age", "Number of People", "Search Percentage", "Population Percentage", "Ratio"), 
+        caption = "Stop and Search Rate by Age v.s. General Age Distribution in London") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+
+```
+
+```{r analysis2_f, message=FALSE, warning=FALSE}
+# Visualisation
+
+# Define an offset value for the label position
+offset <- 5
+
+# Use the `mutate()` function to create the label_y column with proper max values for each age group
+age_search_comparison <- age_search_comparison %>%
+  mutate(label_y = pmax(search_percentage, population_percentage, na.rm = TRUE) + offset)
+
+ggplot(age_search_comparison_long, aes(x = reorder(age_range, rate), y = rate, fill = rate_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Pastel2") +
+  geom_text(
+    data = age_search_comparison,
+    aes(x = age_range, y = label_y, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    vjust = 0.5, 
+    color = "darkgreen",
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Comparing Search Rates with London Age Distribution",
+    subtitle = "Ratios shown above each pair of bars indicate disproportionality",
+    x = "Age Group", 
+    y = "Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    legend.box.background = element_rect(color = "gray80"),
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    plot.title = element_text(size = 16, face = "bold"), # Larger, bold title
+    plot.subtitle = element_text(size = 12), # Clear subtitle
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10) # Add margins for spacing
+  )
+
+```
+
+### 3.2.4 Arrest Rates vs. SSR
+```{r analysis2_g, message=FALSE, warning=FALSE}
+# ___ Age Bias Verification 2 ___
+
+age_search_rate<- ggplot(age_rates, aes(x = reorder(age_range, rate), y = rate, fill = age_range)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Pastel1") +  #
+  theme_minimal() +
+  theme(
+    legend.position = "none",  # Place the legend at the bottom
+    axis.text.y = element_text(size = rel(1.2)),  # Increase y-axis label size
+    axis.title.y = element_blank(),  # Remove y-axis title for cleaner look
+    axis.text.x = element_text(size = rel(1.1)),  # Increase x-axis label size
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),  # Style the plot title
+    legend.title = element_blank()  # Remove legend title
+  ) +
+  labs(title = "Stop-and-Search Rates by Age Group", 
+       x = "Age Group", 
+       y = "Search Rate (%)",
+       fill = "Age Group")  +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2)),
+    # add margin
+    plot.margin = margin(10, 10, 10, 10)
+  ) 
+
+age_arrest_rate <- ggplot(arrest_rate_by_age, aes(x = reorder(age_range, arrest_rate), y = arrest_rate, fill = age_range)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Pastel1") +  #
+  theme_minimal() +
+  theme(
+    legend.position = "none",  # Place the legend at the bottom
+    axis.text.y = element_text(size = rel(1.2)),  # Increase y-axis label size
+    axis.title.y = element_blank(),  # Remove y-axis title for cleaner look
+    axis.text.x = element_text(size = rel(1.1)),  # Increase x-axis label size
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),  # Style the plot title
+    legend.title = element_blank()  # Remove legend title
+  ) +
+  labs(title = "Arrest Rates by Age Group", 
+       x = "Age Group", 
+       y = "Arrest Rate (%)",
+       fill = "Age Group")  +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2)),
+    # add margin
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+# Combined plot without legend
+combined_plot <- age_search_rate + age_arrest_rate + plot_layout(guides = 'collect') & theme(legend.position = "none")
+
+# Display the combined plot
+print(combined_plot)
+
+```
+Note. Since the SSR dataset and Arrest Rate dataset have different categories for age groups. two separate visualisations are created for comparison.
+
+### 3.2.5 Outcome Analysis
+> Lower 'hit' rates for the 10-17 (22.24%) and 18-24 (39.13%) age groups, as opposed to a higher 'hit' rate for the over 34 category (46.86%), imply that searches on younger individuals may be less justified by actual findings. While adults over 34 are found to have a closer match between their hit rates and search rates, the 10-17 tend to have lower hit rates compared to their search rates (ratio = 0.87), indicating potential bias. 
+
+```{r analysis2_h, message=FALSE, warning=FALSE}
+# ___ Age Bias Verification 3 ___
+
+age_hit_miss_rates <- stop_search_data %>%
+  filter(outcome %in% c("TRUE", "FALSE")) %>%
+  mutate(outcome = recode(factor(outcome), `TRUE` = "Hit", `FALSE` = "Miss")) %>%
+  group_by(age_range, outcome) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = count,
+    values_fill = list(count = 0)
+  ) %>%
+  mutate(
+    total_searches = Hit + Miss,
+    hit_rate = Hit / total_searches * 100,
+    miss_rate = Miss / total_searches * 100
+  )
+
+```
+
+```{r analysis2_i, message=FALSE, warning=FALSE}
+# Transforming the dataframe into a long format
+age_hit_miss_rates_long <- age_hit_miss_rates %>%
+  select(age_range, hit_rate, miss_rate) %>%
+  pivot_longer(
+    cols = c(hit_rate, miss_rate),
+    names_to = "outcome_type",
+    values_to = "rate"
+  )
+
+# Creating a stacked bar chart
+ggplot(age_hit_miss_rates_long, aes(x = age_range, y = rate, fill = outcome_type)) +
+  geom_bar(stat = "identity", position = "fill") +  # Stacked bars with relative proportions
+  coord_flip() + 
+  scale_fill_brewer(palette = "Pastel1", name = "Outcome Type") +  # Color palette for better distinction
+  labs(
+    title = "Proportion of Hit and Miss Rates in Stop-and-Search by Age",
+    subtitle = "Analysis of stop-and-search outcomes in different age groups",
+    x = "Age Group",
+    y = "Proportion",
+    fill = "Outcome Type"
+  ) +
+  theme_minimal() +  # Minimal theme for a clean look
+  theme(
+    legend.position = "bottom",  # Legend at the bottom for better interpretation
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),  # Slanted x-axis labels for readability
+    axis.title.x = element_text(size = rel(1.2), face = "bold"),  # Bold axis titles
+    axis.title.y = element_text(size = rel(1.2), face = "bold"),
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),  # Emphasized plot title
+    plot.subtitle = element_text(size = rel(1.2), hjust = 0.5),  # Clear subtitle
+    legend.title.align = 0.5,  # Center-aligned legend title
+    legend.box.background = element_rect(color = "gray80")  # Styled legend background for clarity
+  )
+
+
+```
+
+```{r analysis2_j, message=FALSE, warning=FALSE}
+age_hit_rate <- age_hit_miss_rates %>%
+  select(age_range, hit_rate) %>%
+  mutate(rate = hit_rate, rate_type = "Hit Rate") %>%
+  filter(age_range != "Unknown", age_range != "under 10")
+
+age_search_rate <- age_rates %>%
+  select(age_range, rate) %>%
+  mutate(rate_type = "Search Rate") %>%
+  filter(age_range != "Unknown")
+
+# Combine the data frames
+age_combined_long <- bind_rows(age_hit_rate, age_search_rate)
+
+# Group by age_range and calculate the ratio
+age_combined <- age_combined_long %>%
+  group_by(age_range) %>%
+  summarise(
+    hit_rate = max(rate[rate_type == "Hit Rate"]),
+    search_rate = max(rate[rate_type == "Search Rate"]),
+    ratio = search_rate / hit_rate,
+    .groups = "drop"
+  )
+
+age_combined %>%
+  kable("html", 
+        col.names = c("Age", "Hit Rate", "Search Rate", "Ratio"), 
+        caption = "Comparison of Hit and Search Rates by Age Group") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+
+
+```{r analysis2_k, message=FALSE, warning=FALSE}
+# Visualization
+ggplot(age_combined_long, aes(x = age_range, y = rate, fill = rate_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Pastel1", name = "Rate Type") +
+  geom_text(
+    data = age_combined,
+    aes(x = age_range, y = max(hit_rate, search_rate) + 2, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    position = position_dodge(width = 0.8),
+    vjust = 0.5, 
+    color = "black",
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Comparison of Hit and Search Rates by Age Group",
+    subtitle = "Including Ratios of Search Rate to Hit Rate",
+    x = "Age Group",
+    y = "Rate (%)",
+    fill = "Rate Type"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title.align = 0.5,
+    legend.box.background = element_rect(color = "gray80"),
+    legend.key.size = unit(1, "cm"),
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1), angle = 45, hjust = 1),
+    axis.text.y = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.5), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2), hjust = 0.5)
+  ) +
+  guides(fill = guide_legend())
+
+```
+
+
+## 3.3 Gender Disparities
+
+### 3.3.1 Disproportionate SSR
+> Men encounter an overwhelming SSR of 89.83%, compared to women's 9.54%, pointing to a significant gender imbalance in search incidents.
+
+```{r analysis3_a, message=FALSE, warning=FALSE}
+# ___ Gender Bias Pattern 1 Analysis ___
+
+# Calculate stop-and-search rates by ethnicity
+gender_rates <- stop_search_data %>%
+  count(gender) %>%
+  mutate(rate = n / sum(n) *100)
+
+gender_rates %>%
+  kable("html", 
+        col.names = c("Gender", "Number of Poeple", "Search Rate"), 
+        caption = "Stop and Search Rate Across Gender") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+
+```
+
+```{r analysis3_b, message=FALSE, warning=FALSE}
+# Enhanced bar chart for stop-and-search rates by gender
+ggplot(gender_rates, aes(x = gender, y = rate, fill = gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Pastel1") + 
+  geom_text(aes(label = scales::number(rate, accuracy = 0.1)),  # Adding value labels
+            vjust = -0.3,  # Adjust vertical position of labels
+            size = 3.5,  # Text size
+            color = "darkblue",
+            size = 3.5,
+            fontface = "bold") +  
+  theme_minimal() +
+  labs(title = "Stop-and-Search Rates by Gender", 
+       x = "Gender", 
+       y = "Rate (%)") +
+  theme(
+    legend.position = "none",  # Removing the legend for simplicity
+    axis.title = element_text(size = rel(1.2), face = "bold"),  # Bold axis titles
+    axis.text.x = element_text(size = rel(1.2)),  # Increase x-axis label size
+    axis.text.y = element_text(size = rel(1.2)),  # Increase y-axis label size
+    plot.title = element_text(size = rel(1.5), face = "bold", hjust = 0.5)  # Bold and centered title
+  )
+
+```
+
+
+### 3.3.2 Bias in Search Objectives
+> Men predominantly face searches for offensive weapons and controlled drugs (over 95% and 88% respectively), while women, less frequently searched, are notably investigated for duty-unpaid goods, suggesting gender-based search presumptions.
+
+```{r analysis3_c, message=FALSE, warning=FALSE}
+# ___ Gender Bias Pattern 2 Analysis ___
+
+gender_proportion_within_object <- stop_search_data %>%
+  filter(object_of_search != "NA") %>% 
+  count(object_of_search, gender) %>%
+  group_by(object_of_search) %>%
+  mutate(proportion = n / sum(n) * 100) %>%
+  arrange(object_of_search, desc(proportion))
+
+```
+
+```{r analysis3_d, message=FALSE, warning=FALSE}
+ggplot(gender_proportion_within_object, aes(x = object_of_search, y = proportion, fill = gender)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Pastel1")  +
+  labs(
+    title = "Gender Proportion for Each Search Object",
+    x = "Object of Search",
+    y = "Proportion",
+    fill = "Gender"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    axis.title.x = element_text(size = rel(1.1), face = "bold"), 
+    axis.title.y = element_text(size = rel(1.1), face = "bold"),
+    axis.text.x = element_text(size = rel(1), angle = 0, hjust = 0.5, vjust = 0.5),
+    axis.text.y = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.3), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2), face = "italic"),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20) # Add margins for spacing
+  )
+
+```
+
+### 3.3.3 Population Rate vs. SSR
+> With a roughly equal population distribution, men are subject to stop-and-search almost twice as much as anticipated, indicating potential gender profiling.
+
+```{r}
+# ___ Gender Bias Verification 1 ___
+
+# Merge london_age with the stop-and-search data
+gender_search_comparison <- stop_search_data %>%
+  filter(gender == "Male" | gender == "Female" ) %>%
+  count(gender) %>%
+  mutate(search_percentage = n / sum(n) * 100) %>%
+  left_join(london_sex, by = "gender") %>%
+  mutate(ratio = search_percentage / population_percentage) %>%
+  select(-Number)  
+
+# Transform the data to long format for the bar chart
+gender_search_comparison_long <- gender_search_comparison %>%
+  pivot_longer(
+    cols = c(search_percentage, population_percentage),
+    names_to = "rate_type",
+    values_to = "rate"
+  )
+
+gender_search_comparison %>%
+  kable("html", 
+        col.names = c("Gender"," Number of Poeple", "Search Percentage", "Population Percentage", "Ratio"), 
+        caption = "Stop and Search Rate by Gender v.s. General Gender Distribution in London") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+
+```{r analysis3_e, message=FALSE, warning=FALSE}
+# Define an offset value for the label position
+offset <- 2
+
+# Use the `mutate()` function to create the label_y column with proper max values for each age group
+gender_search_comparison <- gender_search_comparison %>%
+  mutate(label_y = pmax(search_percentage, population_percentage, na.rm = TRUE) + offset)
+
+# Now, use the updated data frame in your plot
+ggplot(gender_search_comparison_long, aes(x = reorder(gender, rate), y = rate, fill = rate_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Pastel2") +
+  geom_text(
+    data = gender_search_comparison,
+    aes(x = gender, y = label_y, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    vjust = 0.5, 
+    color = "darkgreen",
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Comparing Search Rates with London Gender Distribution",
+    subtitle = "Ratios shown above each pair of bars indicate disproportionality",
+    x = "Age Group", 
+    y = "Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    legend.box.background = element_rect(color = "gray80"),
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    plot.title = element_text(size = 16, face = "bold"), # Larger, bold title
+    plot.subtitle = element_text(size = 12), # Clear subtitle
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10) # Add margins for spacing
+  )
+
+```
+
+### 3.3.4 Arrest Rate vs. SSR
+> While the SSR for men mirrors their arrest rate, the lower SSR for women compared to their arrest rate may signal underuse of stop-and-search for females.
+
+```{r analysis3_f, message=FALSE, warning=FALSE}
+# ___ Gender Bias Verification 2 ___
+
+comparison_arrest_sex <- merge(arrest_rate_by_sex, gender_rates, by = "gender") 
+
+comparison_arrest_sex <- comparison_arrest_sex %>%
+  rename(search_rate="rate",
+         search_number="n") %>%
+  mutate(ratio = search_rate / arrest_rate) 
+
+# round down to integer to make it more readable
+comparison_arrest_sex$search_rate <- floor(comparison_arrest_sex$search_rate) 
+
+# Ensuring correct data types
+comparison_arrest_sex$gender <- as.factor(comparison_arrest_sex$gender)
+comparison_arrest_sex$arrest_rate <- as.numeric(comparison_arrest_sex$arrest_rate)
+comparison_arrest_sex$search_number <- as.numeric(comparison_arrest_sex$search_number)
+comparison_arrest_sex$search_rate <- as.numeric(comparison_arrest_sex$search_rate)
+
+comparison_arrest_sex %>%
+  kable("html", 
+        col.names = c("Gender", "Arrest Rate", "Search Number", "Search Rate", "Ratio"), 
+        caption = "Comparing Stop and Search Rate with Arrest Rates by Gender in UK") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+
+```{r analysis3_g, message=FALSE, warning=FALSE}
+# Reshape data for plotting
+comparison_arrest_sex_plot <- comparison_arrest_sex %>% 
+  select(gender, arrest_rate, search_rate, ratio) %>% 
+  filter(gender == "Female" | gender == "Male")
+
+comparison_arrest_sex_long <- comparison_arrest_sex_plot %>%
+  pivot_longer(cols = c(arrest_rate, search_rate), 
+               names_to = "Rate_Type", 
+               values_to = "Rate")
+
+# Create the plot
+ggplot(comparison_arrest_sex_long, aes(x = reorder(gender, Rate), y = Rate, fill = Rate_Type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Pastel2") +
+  labs(title = "Comparison of Search and Arrest Rates by Gender",
+       x = "Gender",
+       y = "Rate",
+       fill = "Rate Type") +
+  geom_text(
+    data = comparison_arrest_sex_plot,
+    aes(x = gender, y = max(search_rate, arrest_rate) + 2, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    position = position_dodge(width = 0.8),
+    vjust = 0.5, 
+    color = "darkgreen", # Changed color for better visibility
+    size = 3.5, # Increased text size for readability
+    fontface = "bold" # Bold text for emphasis
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1)),
+    legend.box.background = element_rect(color = "gray80"),
+    legend.title = element_blank(), # Remove legend title for cleaner look
+    plot.title = element_text(size = 16, face = "bold"), # Larger, bold title
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10) # Add margins for spacing
+  )
+```
+
+### 3.3.5 Outcome Analysis
+> Women, while searched less, exhibit hit rates comparable to men (37.41% versus 33.75%). Meanwhile, men tend to have lower hit rates then SSR (ratio = 2.66), indicating potential bias.
+
+```{r}
+# ___ Gender Bias Verification 3 ___
+
+sex_hit_miss_rates <- stop_search_data %>%
+  filter(outcome %in% c("TRUE", "FALSE")) %>%
+  mutate(outcome = recode(factor(outcome), `TRUE` = "Hit", `FALSE` = "Miss")) %>%
+  group_by(gender, outcome) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = count,
+    values_fill = list(count = 0)
+  ) %>%
+  mutate(
+    total_searches = Hit + Miss,
+    hit_rate = Hit / total_searches * 100,
+    miss_rate = Miss / total_searches * 100
+  )
+
+```
+
+```{r analysis3_i, message=FALSE, warning=FALSE}
+# Transforming the dataframe into a long format
+sex_hit_miss_rates_long <- sex_hit_miss_rates %>%
+  select(gender, hit_rate, miss_rate) %>%
+  pivot_longer(
+    cols = c(hit_rate, miss_rate),
+    names_to = "outcome_type",
+    values_to = "rate"
+  )
+
+# Creating a stacked bar chart
+ggplot(sex_hit_miss_rates_long, aes(x = gender, y = rate, fill = outcome_type)) +
+  geom_bar(stat = "identity", position = "fill") +  # Stacked bars with relative proportions
+  coord_flip() + 
+  scale_fill_brewer(palette = "Pastel2", name = "Outcome Type") +  # Color palette for better distinction
+  labs(
+    title = "Proportion of Hit and Miss Rates in Stop-and-Search by Gender",
+    subtitle = "Analysis of stop-and-search outcomes in different genders",
+    x = "Gender",
+    y = "Proportion (%)",
+    fill = "Outcome Type"
+  ) +
+  theme_minimal() +  # Minimal theme for a clean look
+  theme(
+    legend.position = "bottom",  # Legend at the bottom for better interpretation
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),  # Slanted x-axis labels for readability
+    axis.title.x = element_text(size = rel(1.2), face = "bold"),  # Bold axis titles
+    axis.title.y = element_text(size = rel(1.2), face = "bold"),
+    plot.title = element_text(size = rel(1.4), face = "bold", hjust = 0.5),  # Emphasized plot title
+    plot.subtitle = element_text(size = rel(1.2), hjust = 0.5),  # Clear subtitle
+    legend.title.align = 0.5,  # Center-aligned legend title
+    legend.box.background = element_rect(color = "gray80")  # Styled legend background for clarity
+  )
+
+```
+
+```{r analysis3_j, message=FALSE, warning=FALSE}
+sex_hit_rate <- sex_hit_miss_rates %>%
+  select(gender, hit_rate) %>%
+  mutate(rate = hit_rate, rate_type = "Hit Rate")
+
+sex_search_rate <- gender_rates %>%
+  select(gender, rate) %>%
+  filter(gender != "Other") %>% 
+  mutate(rate_type = "Search Rate")
+
+# Combine the data frames
+sex_combined_long <- bind_rows(sex_hit_rate, sex_search_rate)
+
+# Group by age_range and calculate the ratio
+sex_combined <- sex_combined_long %>%
+  group_by(gender) %>%
+  summarise(
+    hit_rate = max(rate[rate_type == "Hit Rate"]),
+    search_rate = max(rate[rate_type == "Search Rate"]),
+    ratio = search_rate / hit_rate,
+    .groups = "drop"
+  )
+
+sex_combined %>%
+  kable("html", 
+        col.names = c("Gender", "Hit Rate", "Search Rate", "Ratio"), 
+        caption = "Comparison of Hit and Search Rates by Gender") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T) %>%
+  row_spec(0, bold = T, color = "white", background = "lightblue")
+```
+```{r analysis3_k, message=FALSE, warning=FALSE}
+# Visualization
+ggplot(sex_combined_long, aes(x = gender, y = rate, fill = rate_type)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Pastel2", name = "Rate Type") +
+  geom_text(
+    data = sex_combined,
+    aes(x = gender, y = max(hit_rate, search_rate) + 2, label = scales::number(ratio, accuracy = 0.01)),
+    inherit.aes = FALSE,
+    position = position_dodge(width = 0.8),
+    vjust = 0.5, 
+    color = "darkgreen",
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Comparison of Hit and Search Rates by Gender",
+    subtitle = "Including Ratios of Search Rate to Hit Rate",
+    x = "Gender",
+    y = "Rate (%)",
+    fill = "Rate Type"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title.align = 0.5,
+    legend.box.background = element_rect(color = "gray80"),
+    legend.key.size = unit(1, "cm"),
+    axis.title.x = element_text(size = rel(1), face = "bold"),
+    axis.title.y = element_text(size = rel(1), face = "bold"),
+    axis.text.x = element_text(size = rel(1), angle = 45, hjust = 1),
+    axis.text.y = element_text(size = rel(1)),
+    plot.title = element_text(size = rel(1.5), face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = rel(1.2), hjust = 0.5)
+  ) +
+  guides(fill = guide_legend())
+
+```
+
+# 4. Conclusion
+> Profiling biases are detected in stop-and-search practices by the London police, with disproportionate targeting of 'Other' and 'Black' ethnic groups, young adults aged 10-24, and  men. Such disparities are not fully justified by arrest rates or search effectiveness, suggesting that personal attributes, rather than objective evidence,  influence police stop-and-search decision-making.
+
+# 5. Code Appendix
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
